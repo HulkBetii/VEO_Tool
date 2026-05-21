@@ -68,6 +68,7 @@ class TaskWorker(QThread):
         self._cancelled = False
         self._paused = False
         self._opened_account_ids = set()
+        self._loop = None
 
     def _cancellable_sleep(self, seconds):
         end = time.time() + seconds
@@ -90,12 +91,22 @@ class TaskWorker(QThread):
         self._paused = False
 
     def run(self):
+        self._loop = asyncio.new_event_loop()
         try:
+            asyncio.set_event_loop(self._loop)
             self._execute()
         except Exception as e:
             self.signals.task_error.emit(self._task_id(), str(e))
         finally:
-            self._close_browser_contexts()
+            try:
+                self._close_browser_contexts()
+            finally:
+                try:
+                    asyncio.set_event_loop(None)
+                except Exception:
+                    pass
+                self._loop.close()
+                self._loop = None
 
     def _execute(self):
         task_id = self._task_id()
@@ -127,27 +138,20 @@ class TaskWorker(QThread):
         self.signals.task_completed.emit(task_id)
 
     def _close_browser_contexts(self):
-        """Close all browser contexts opened during this task. Best-effort.
-
-        Uses a fresh event loop instead of asyncio.run() to avoid
-        'This event loop is already running' if called from a finally block
-        while a prior asyncio.run() in the same thread is still on the stack.
-        """
-        if self.browser_manager is None or not self._opened_account_ids:
+        """Close all browser contexts opened during this task on the worker loop."""
+        if self.browser_manager is None or not self._opened_account_ids or self._loop is None:
             return
-        loop = asyncio.new_event_loop()
         try:
             for account_id in list(self._opened_account_ids):
                 try:
-                    loop.run_until_complete(self.browser_manager.close_context(account_id))
+                    self._loop.run_until_complete(self.browser_manager.close_context(account_id))
                 except Exception as e:
                     log.warning(f"Could not close browser context {account_id}: {e}")
         finally:
-            loop.close()
             self._opened_account_ids.clear()
 
     def _run_one(self, item):
-        return asyncio.run(self._process_item_async(item))
+        return self._loop.run_until_complete(self._process_item_async(item))
 
     def _process_item(self, item):
         return self._run_one(item)

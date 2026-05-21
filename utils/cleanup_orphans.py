@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import os
 import shutil
 import signal
@@ -44,15 +45,15 @@ def _kill_orphan_chromes():
                 text=True,
                 timeout=15,
             )
-            for line in result.stdout.splitlines():
-                if marker not in line:
+            for row in csv.reader(result.stdout.splitlines()):
+                if not row or row[0] == "ProcessId":
                     continue
-                # CSV columns: "ProcessId","CommandLine"
-                parts = line.strip().strip('"').split('","')
-                if not parts:
+                pid_text = str(row[0]).strip()
+                command_line = row[1] if len(row) > 1 else ""
+                if marker not in command_line:
                     continue
                 try:
-                    pid = int(parts[0].strip().strip('"'))
+                    pid = int(pid_text)
                     subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, timeout=5)
                     killed += 1
                 except Exception:
