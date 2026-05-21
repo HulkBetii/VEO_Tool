@@ -1,0 +1,31 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# App data (database, logs, cookies, browser profiles)
+.vidgen/
+
+# Claude Code settings
+.claude/
+
+# Bundled binaries
+ffmpeg/
+.u2net/
+.cache/
+
+# Output folders
+image_output/
+video_output/
+
+# Secrets / credentials
+*.json
+!config/*.json
+
+# IDE
+.vscode/
+.idea/
