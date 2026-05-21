@@ -67,7 +67,7 @@ class TaskWorker(QThread):
         self.signals = WorkerSignals()
         self._cancelled = False
         self._paused = False
-        self._opened_account_ids = set()
+        self._opened_account_ids: list[int] = []
         self._loop = None
 
     def _cancellable_sleep(self, seconds):
@@ -164,7 +164,7 @@ class TaskWorker(QThread):
         account = self._acquire_account()
         if account is None:
             raise RuntimeError("No enabled Google account available")
-        self._opened_account_ids.add(account.id)
+        self._opened_account_ids.append(account.id)
 
         try:
             if self.browser_manager is None:
@@ -287,10 +287,18 @@ class TaskWorker(QThread):
             elif isinstance(char_images, list):
                 paths.extend(char_images)
 
+        # Fallback to task-level start_frame/end_frame only if the item
+        # didn't already provide them (avoids sending duplicate/conflicting frames).
+        item_frame_keys = set()
+        if isinstance(item, dict):
+            item_frame_keys = {k for k in ("start_frame", "end_frame") if item.get(k)}
+        else:
+            item_frame_keys = {k for k in ("start_frame", "end_frame") if getattr(item, k, None)}
         for key in ("start_frame", "end_frame"):
-            value = self._task_value(key, None)
-            if value:
-                paths.append(value)
+            if key not in item_frame_keys:
+                value = self._task_value(key, None)
+                if value:
+                    paths.append(value)
 
         seen = set()
         result = []
