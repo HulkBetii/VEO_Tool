@@ -445,40 +445,30 @@ class YouTubeAnalyzer:
     def _yt_dlp_cmd(self):
         """Return a runnable yt-dlp command prefix.
 
-        GUI apps on macOS often launch without Homebrew paths in PATH, so
-        shutil.which("yt-dlp") may fail even when /opt/homebrew/bin/yt-dlp exists.
+        Uses find_binary() which checks Homebrew paths on macOS so the tool is
+        found even when the app is launched as a .app bundle without /opt/homebrew/bin in PATH.
         """
-        candidates = []
-        env_path = os.environ.get("NAVTOOLS_YT_DLP")
-        if env_path:
-            candidates.append(Path(env_path))
-        found = shutil.which("yt-dlp")
-        if found:
-            candidates.append(Path(found))
-        base_dir = Path(__file__).resolve().parents[1]
-        candidates.extend(
-            [
-                base_dir / "yt-dlp",
-                base_dir / "yt-dlp.exe",
-                base_dir / "bin" / "yt-dlp",
-                base_dir / "bin" / "yt-dlp.exe",
-                Path("/opt/homebrew/bin/yt-dlp"),
-                Path("/usr/local/bin/yt-dlp"),
-            ]
-        )
-        for candidate in candidates:
-            if candidate and candidate.exists():
-                return [str(candidate)]
+        try:
+            from utils.platform import find_binary
+            base_dir = Path(__file__).resolve().parents[1]
+            path = find_binary("yt-dlp", base_dir=base_dir, env_var="NAVTOOLS_YT_DLP")
+            if path != "yt-dlp" or shutil.which("yt-dlp"):
+                # Confirmed real path or shutil found it on PATH
+                return [path]
+        except Exception:
+            pass
+
+        # Python-package fallback (pip install yt-dlp)
         try:
             import importlib.util
-
             if importlib.util.find_spec("yt_dlp") is not None:
                 return [sys.executable, "-m", "yt_dlp"]
         except Exception:
             pass
+
         raise RuntimeError(
             "Không tìm thấy yt-dlp. Cài bằng: brew install yt-dlp hoặc pip install yt-dlp. "
-            "Nếu đã cài, đặt biến NAVTOOLS_YT_DLP trỏ tới file yt-dlp."
+            "Nếu đã cài, đặt biến môi trường NAVTOOLS_YT_DLP trỏ tới file yt-dlp."
         )
 
     async def download(self, url, progress_cb=None):
@@ -618,7 +608,14 @@ class YouTubeAnalyzer:
                 scenes.append({"scene_num": i + 1, "start": start, "end": end, "keyframe": str(keyframe)})
             cap.release()
         else:
-            ffmpeg = str(FFMPEG_PATH) if FFMPEG_PATH else "ffmpeg"
+            # Re-resolve at call time so Homebrew paths found after PATH is set
+            # by the launcher are picked up (FFMPEG_PATH is a module-level constant
+            # resolved at import time before Homebrew PATH may be available).
+            try:
+                from utils.platform import find_ffmpeg as _ff
+                ffmpeg = _ff()
+            except Exception:
+                ffmpeg = str(FFMPEG_PATH) if FFMPEG_PATH else "ffmpeg"
             for i in range(count):
                 start = i * VEO_VIDEO_LENGTH
                 end = min(total or start + VEO_VIDEO_LENGTH, start + VEO_VIDEO_LENGTH)
@@ -686,7 +683,12 @@ class YouTubeAnalyzer:
         return segments
 
     def _probe_audio_duration(self, audio_path):
-        cmd = [str(FFMPEG_PATH).replace("ffmpeg", "ffprobe"), "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", str(audio_path)]
+        try:
+            from utils.platform import find_binary as _fb
+            ffprobe = _fb("ffprobe")
+        except Exception:
+            ffprobe = str(FFMPEG_PATH).replace("ffmpeg", "ffprobe")
+        cmd = [ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", str(audio_path)]
         proc = subprocess.run(cmd, capture_output=True, text=True, creationflags=get_subprocess_flags())
         try:
             return float(proc.stdout.strip())

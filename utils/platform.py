@@ -43,21 +43,57 @@ def _find_chrome_linux():
     return None
 
 
-def find_ffmpeg(base_dir=None):
-    candidates = []
+def _macos_homebrew_candidates(name: str) -> list:
+    """Return likely Homebrew / system paths for `name` on macOS.
+
+    GUI .app bundles on macOS launch without /opt/homebrew/bin in PATH, so
+    shutil.which() misses Homebrew-installed tools even when they exist.
+    """
+    return [
+        Path("/opt/homebrew/bin") / name,   # Apple-Silicon Homebrew
+        Path("/usr/local/bin") / name,       # Intel Homebrew / manual install
+        Path("/usr/bin") / name,             # system install
+    ]
+
+
+def find_binary(name: str, base_dir=None, env_var: str = "") -> str:
+    """Locate a binary by name, checking bundled path, env-var override,
+    shutil.which, and macOS Homebrew locations.  Returns the full path or
+    falls back to bare *name* (lets the OS try at runtime).
+    """
+    candidates: list[Path] = []
+
+    # 1. Environment-variable override (highest priority).
+    if env_var:
+        override = os.environ.get(env_var, "")
+        if override:
+            candidates.append(Path(override))
+
+    # 2. Bundled binary next to the project root.
     if base_dir:
         base = Path(base_dir)
-        candidates.extend([
-            base / "ffmpeg.exe",
-            base / "bin" / "ffmpeg.exe",
-            base / "ffmpeg" / "bin" / "ffmpeg.exe",
-            base / "tools" / "ffmpeg.exe",
-            base / "tools" / "ffmpeg" / "bin" / "ffmpeg.exe",
-        ])
-    for path in candidates:
-        if path.exists():
-            return str(path)
-    return shutil.which("ffmpeg") or shutil.which("ffmpeg.exe") or "ffmpeg"
+        for rel in (name, f"{name}.exe", f"bin/{name}", f"bin/{name}.exe",
+                    f"tools/{name}", f"tools/{name}/bin/{name}"):
+            candidates.append(base / rel)
+
+    # 3. PATH lookup.
+    found = shutil.which(name) or shutil.which(f"{name}.exe")
+    if found:
+        candidates.append(Path(found))
+
+    # 4. macOS Homebrew / system paths (needed when launched as .app bundle).
+    if _platform.system() == "Darwin":
+        candidates.extend(_macos_homebrew_candidates(name))
+
+    for p in candidates:
+        if p and p.is_file():       # is_file() skips directories (e.g. bundled "ffmpeg/" dir)
+            return str(p)
+
+    return name  # fall back to bare name; subprocess will try $PATH at launch time
+
+
+def find_ffmpeg(base_dir=None):
+    return find_binary("ffmpeg", base_dir=base_dir, env_var="NAVTOOLS_FFMPEG")
 
 
 def get_subprocess_flags():
