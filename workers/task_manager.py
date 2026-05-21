@@ -236,9 +236,15 @@ class TaskWorker(QThread):
             self._release_account(account)
 
     def _task_items(self):
-        items = getattr(self.task, "items", None)
-        if items:
-            return list(items)
+        # IMPORTANT: use dict-aware lookup.  getattr(dict_obj, "items") returns
+        # the builtin dict.items METHOD (truthy) instead of the "items" key value,
+        # causing "builtin_function_or_method is not iterable" at list(items).
+        if isinstance(self.task, dict):
+            raw_items = self.task.get("items", None)
+        else:
+            raw_items = getattr(self.task, "items", None)
+        if raw_items:
+            return list(raw_items)
         prompts = self._task_value("prompts", None)
         if prompts is None:
             prompt = self._task_value("prompt", "")
