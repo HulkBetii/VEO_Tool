@@ -30,23 +30,33 @@ def _kill_orphan_chromes():
 
     killed = 0
     if sys.platform == "win32":
+        # Use PowerShell + Get-CimInstance (works on Windows 10/11).
+        # wmic is deprecated and removed from Windows 11 22H2+.
+        ps_script = (
+            "Get-CimInstance Win32_Process -Filter \\\"name like '%chrome%'\\\" "
+            "| Select-Object ProcessId,CommandLine "
+            "| ConvertTo-Csv -NoTypeInformation"
+        )
         try:
             result = subprocess.run(
-                ["wmic", "process", "where", f"name like '%chrome%'", "get", "ProcessId,CommandLine", "/format:csv"],
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
                 capture_output=True,
                 text=True,
-                timeout=10,
+                timeout=15,
             )
             for line in result.stdout.splitlines():
-                if marker in line:
-                    parts = line.strip().split(",")
-                    if len(parts) >= 2:
-                        try:
-                            pid = int(parts[-1].strip())
-                            subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, timeout=5)
-                            killed += 1
-                        except Exception:
-                            pass
+                if marker not in line:
+                    continue
+                # CSV columns: "ProcessId","CommandLine"
+                parts = line.strip().strip('"').split('","')
+                if not parts:
+                    continue
+                try:
+                    pid = int(parts[0].strip().strip('"'))
+                    subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, timeout=5)
+                    killed += 1
+                except Exception:
+                    pass
         except Exception as e:
             log.debug(f"_kill_orphan_chromes (win32): {e}")
     else:

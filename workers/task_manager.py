@@ -127,20 +127,24 @@ class TaskWorker(QThread):
         self.signals.task_completed.emit(task_id)
 
     def _close_browser_contexts(self):
-        """Close all browser contexts opened during this task. Best-effort."""
-        if self.browser_manager is None or self.account_pool is None:
+        """Close all browser contexts opened during this task. Best-effort.
+
+        Uses a fresh event loop instead of asyncio.run() to avoid
+        'This event loop is already running' if called from a finally block
+        while a prior asyncio.run() in the same thread is still on the stack.
+        """
+        if self.browser_manager is None or not self._opened_account_ids:
             return
-        import asyncio as _asyncio
-        closed = set()
-        for account_id in list(self._opened_account_ids):
-            if account_id in closed:
-                continue
-            try:
-                _asyncio.run(self.browser_manager.close_context(account_id))
-                closed.add(account_id)
-            except Exception as e:
-                log.warning(f"Could not close browser context {account_id}: {e}")
-        self._opened_account_ids.clear()
+        loop = asyncio.new_event_loop()
+        try:
+            for account_id in list(self._opened_account_ids):
+                try:
+                    loop.run_until_complete(self.browser_manager.close_context(account_id))
+                except Exception as e:
+                    log.warning(f"Could not close browser context {account_id}: {e}")
+        finally:
+            loop.close()
+            self._opened_account_ids.clear()
 
     def _run_one(self, item):
         return asyncio.run(self._process_item_async(item))
@@ -316,7 +320,7 @@ class TaskWorker(QThread):
         if "Lite" in quality:
             return f"veo_3_1_t2v_{orientation}_lite"
         if "Lower Priority" in quality:
-            return f"veo_3_1_t2v_{orientation}_fast_relaxed"
+            return f"veo_3_1_t2v_{orientation}_ultra_relaxed"
         if "Quality" in quality:
             return f"veo_3_1_t2v_{orientation}"
         return f"veo_3_1_t2v_{orientation}_fast"
