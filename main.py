@@ -246,6 +246,15 @@ def main():
     current_user = db.get_setting("current_user") or "user"
     log.info(f"Logged in as: {current_user}")
 
+    browser_manager = None
+    try:
+        from automation.browser_manager import BrowserManager
+
+        browser_manager = BrowserManager()
+        log.info("Browser manager initialized")
+    except Exception as e:
+        log.error(f"Browser manager init failed: {e}")
+
     splash = None
     try:
         from ui.widgets.loading_splash import LoadingSplash
@@ -262,7 +271,7 @@ def main():
         if splash:
             splash.set_progress(40, "Tải các trang chính...")
 
-        window = MainWindow(db=db, settings=settings)
+        window = MainWindow(db=db, settings=settings, browser_manager=browser_manager)
         window.setWindowTitle(f"{APP_NAME} v{APP_VERSION} — {current_user}")
 
         if splash:

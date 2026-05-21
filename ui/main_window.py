@@ -175,12 +175,17 @@ class MainWindow(QMainWindow):
             try:
                 from workers.task_manager import TaskManager
 
-                self.task_manager = TaskManager(self.db, self.browser_manager)
+                self.task_manager = TaskManager(self.db, self.browser_manager, self)
             except TypeError:
-                self.task_manager = TaskManager(self.db)
+                self.task_manager = TaskManager(self.db, parent=self)
             except Exception as e:
                 log.warning(f"TaskManager unavailable: {e}")
                 self.task_manager = None
+        if self.task_manager is not None and getattr(self, "long_video_page", None) is not None:
+            try:
+                self.long_video_page._account_pool = self.task_manager.account_pool
+            except Exception:
+                pass
         return self.task_manager
 
     def _on_account_disabled(self, account_id, email, reason):
@@ -472,6 +477,13 @@ class MainWindow(QMainWindow):
         if manager and hasattr(manager, "stop_all"):
             try:
                 manager.stop_all()
+            except Exception:
+                pass
+        if self.browser_manager is not None and hasattr(self.browser_manager, "stop"):
+            try:
+                import asyncio
+
+                asyncio.run(self.browser_manager.stop())
             except Exception:
                 pass
         super().closeEvent(event)

@@ -290,18 +290,26 @@ class SettingsDialog(QDialog):
         self._monitor_login_and_fetch()
 
     def _monitor_login_and_fetch(self):
+        self._login_signals = _LoginSignals()
+        self._login_signals.success.connect(self._on_login_success, type=Qt.ConnectionType.QueuedConnection)
+        self._login_signals.status.connect(self._on_login_status, type=Qt.ConnectionType.QueuedConnection)
+        self._login_signals.failed.connect(self._on_login_failed, type=Qt.ConnectionType.QueuedConnection)
+        self._login_signals.finished.connect(self._on_login_finished, type=Qt.ConnectionType.QueuedConnection)
         thread = threading.Thread(target=lambda: asyncio.run(self._async_monitor_login()), daemon=True)
         thread.start()
         self._login_thread = thread
 
     async def _async_monitor_login(self):
-        for _ in range(180):
-            info = _read_chrome_cookies(Path(BROWSER_PROFILE_DIR))
-            if info.get("email"):
-                self._on_login_success(info["email"], str(BROWSER_PROFILE_DIR), info.get("cookie_exp"), None, None)
-                return
-            await asyncio.sleep(1)
-        self._on_login_failed("Đăng nhập quá thời gian chờ.")
+        try:
+            for _ in range(180):
+                info = _read_chrome_cookies(Path(BROWSER_PROFILE_DIR))
+                if info.get("email"):
+                    self._login_signals.success.emit(info["email"], str(BROWSER_PROFILE_DIR), info.get("cookie_exp"), None, None)
+                    return
+                await asyncio.sleep(1)
+            self._login_signals.failed.emit("Đăng nhập quá thời gian chờ.")
+        finally:
+            self._login_signals.finished.emit()
 
     def _on_login_success(self, email, cookie_path, cookie_exp=None, token_exp=None, gemini_api_key=None):
         account = None
@@ -331,6 +339,10 @@ class SettingsDialog(QDialog):
     def _renew_session(self, account):
         if not account:
             return
+        self._renew_signals = _RenewSignals()
+        self._renew_signals.success.connect(self._on_renew_success, type=Qt.ConnectionType.QueuedConnection)
+        self._renew_signals.failed.connect(self._on_renew_failed, type=Qt.ConnectionType.QueuedConnection)
+        self._renew_signals.finished.connect(self._on_renew_finished, type=Qt.ConnectionType.QueuedConnection)
         thread = threading.Thread(target=lambda: self._run_renew(account.id, account.email, account.cookie_path, None), daemon=True)
         thread.start()
         self._renew_thread = thread
@@ -339,7 +351,9 @@ class SettingsDialog(QDialog):
         try:
             asyncio.run(self._async_renew(account_id, email, cookie_path, progress))
         except Exception as e:
-            self._on_renew_failed(account_id, str(e))
+            self._renew_signals.failed.emit(account_id, str(e))
+        finally:
+            self._renew_signals.finished.emit()
 
     def _cleanup_renew_chrome(self, profile_dir):
         return None
@@ -347,7 +361,7 @@ class SettingsDialog(QDialog):
     async def _async_renew(self, account_id, email, cookie_path, progress=None):
         await asyncio.sleep(0.5)
         info = _read_chrome_cookies(Path(cookie_path or BROWSER_PROFILE_DIR))
-        self._on_renew_success(account_id, info.get("cookie_exp"), None, info.get("email") or email)
+        self._renew_signals.success.emit(account_id, info.get("cookie_exp"), None, info.get("email") or email)
 
     def _on_renew_success(self, account_id, cookie_exp=None, token_exp=None, email=None):
         account = self.db.get_account(account_id)

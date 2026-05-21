@@ -20,7 +20,7 @@ class Database:
 
         self._db_path = str(db_path or DB_PATH)
         self._conn = None
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     def connect(self):
         """Open database connection and create tables."""
@@ -46,12 +46,20 @@ class Database:
         with self._lock:
             return self.conn.execute(sql, params)
 
+    def execute_and_commit(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
+        """Execute + commit in a single lock hold — guarantees lastrowid is correct."""
+        with self._lock:
+            cursor = self.conn.execute(sql, params)
+            self.conn.commit()
+            return cursor
+
     def commit(self):
         with self._lock:
             self.conn.commit()
 
     def _create_tables(self):
-        self.conn.executescript(
+        with self._lock:
+            self.conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS accounts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -125,7 +133,7 @@ class Database:
                 ON task_items(status);
         """
         )
-        self.commit()
+            self.conn.commit()
         self._migrate()
 
     def _migrate(self):
@@ -133,43 +141,37 @@ class Database:
         try:
             cols = [row[1] for row in self.execute("PRAGMA table_info(accounts)").fetchall()]
             if "token_exp" not in cols:
-                self.execute("ALTER TABLE accounts ADD COLUMN token_exp DATETIME")
-                self.commit()
+                self.execute_and_commit("ALTER TABLE accounts ADD COLUMN token_exp DATETIME")
         except Exception:
             pass
 
         try:
             cols = [row[1] for row in self.execute("PRAGMA table_info(tasks)").fetchall()]
             if "image_model" not in cols:
-                self.execute("ALTER TABLE tasks ADD COLUMN image_model TEXT DEFAULT 'Nano Banana 2'")
-                self.commit()
+                self.execute_and_commit("ALTER TABLE tasks ADD COLUMN image_model TEXT DEFAULT 'Nano Banana 2'")
         except Exception:
             pass
 
         try:
             cols = [row[1] for row in self.execute("PRAGMA table_info(accounts)").fetchall()]
             if "gemini_api_key" not in cols:
-                self.execute("ALTER TABLE accounts ADD COLUMN gemini_api_key TEXT")
-                self.commit()
+                self.execute_and_commit("ALTER TABLE accounts ADD COLUMN gemini_api_key TEXT")
         except Exception:
             pass
 
         try:
             cols = [row[1] for row in self.execute("PRAGMA table_info(task_items)").fetchall()]
             if "flow_project_id" not in cols:
-                self.execute("ALTER TABLE task_items ADD COLUMN flow_project_id TEXT")
-                self.commit()
+                self.execute_and_commit("ALTER TABLE task_items ADD COLUMN flow_project_id TEXT")
             if "gen_account_id" not in cols:
-                self.execute("ALTER TABLE task_items ADD COLUMN gen_account_id INTEGER")
-                self.commit()
+                self.execute_and_commit("ALTER TABLE task_items ADD COLUMN gen_account_id INTEGER")
         except Exception:
             pass
 
         try:
             cols = [row[1] for row in self.execute("PRAGMA table_info(tasks)").fetchall()]
             if "parallel_per_account" not in cols:
-                self.execute("ALTER TABLE tasks ADD COLUMN parallel_per_account INTEGER DEFAULT 1")
-                self.commit()
+                self.execute_and_commit("ALTER TABLE tasks ADD COLUMN parallel_per_account INTEGER DEFAULT 1")
         except Exception:
             pass
 
@@ -186,12 +188,11 @@ class Database:
         return Account.from_row(row) if row else None
 
     def add_account(self, email: str, proxy: str = None) -> Account:
-        cursor = self.execute("INSERT INTO accounts (email, proxy) VALUES (?, ?)", (email, proxy))
-        self.commit()
+        cursor = self.execute_and_commit("INSERT INTO accounts (email, proxy) VALUES (?, ?)", (email, proxy))
         return self.get_account(cursor.lastrowid)
 
     def update_account(self, account: Account):
-        self.execute(
+        self.execute_and_commit(
             """UPDATE accounts SET
                 enabled=?, tier=?, credit=?, proxy=?,
                 cookie_path=?, cookie_exp=?, token_exp=?,
@@ -209,34 +210,32 @@ class Database:
                 account.id,
             ),
         )
-        self.commit()
 
     def update_account_credit(self, account_id: int, credit: int):
-        self.execute("UPDATE accounts SET credit = ? WHERE id = ?", (credit, account_id))
-        self.commit()
+        self.execute_and_commit("UPDATE accounts SET credit = ? WHERE id = ?", (credit, account_id))
 
     def delete_account(self, account_id: int):
-        self.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
-        self.commit()
+        self.execute_and_commit("DELETE FROM accounts WHERE id = ?", (account_id,))
 
     def get_projects(self) -> list[Project]:
         rows = self.execute("SELECT * FROM projects ORDER BY created_at DESC").fetchall()
         return [Project.from_row(r) for r in rows]
 
     def get_or_create_project(self, name: str, folder_path: str = "") -> Project:
-        row = self.execute("SELECT * FROM projects WHERE name = ?", (name,)).fetchone()
-        if row:
-            return Project.from_row(row)
-        cursor = self.execute("INSERT INTO projects (name, folder_path) VALUES (?, ?)", (name, folder_path))
-        self.commit()
-        return self.get_project(cursor.lastrowid)
+        with self._lock:
+            row = self.conn.execute("SELECT * FROM projects WHERE name = ?", (name,)).fetchone()
+            if row:
+                return Project.from_row(row)
+            cursor = self.conn.execute("INSERT INTO projects (name, folder_path) VALUES (?, ?)", (name, folder_path))
+            self.conn.commit()
+            return self.get_project(cursor.lastrowid)
 
     def get_project(self, project_id: int) -> Optional[Project]:
         row = self.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
         return Project.from_row(row) if row else None
 
     def create_task(self, task: VideoTask) -> VideoTask:
-        cursor = self.execute(
+        cursor = self.execute_and_commit(
             """INSERT INTO tasks
                 (project_id, account_id, name, mode, quality, aspect_ratio,
                  concurrent, character_images, input_folder, output_folder,
@@ -259,7 +258,6 @@ class Database:
                 task.parallel_per_account,
             ),
         )
-        self.commit()
         task.id = cursor.lastrowid
         return task
 
@@ -276,12 +274,10 @@ class Database:
         return [VideoTask.from_row(r) for r in rows]
 
     def update_task_status(self, task_id: int, status: str):
-        self.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
-        self.commit()
+        self.execute_and_commit("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
 
     def update_task_progress(self, task_id: int, done: int, errors: int):
-        self.execute("UPDATE tasks SET done_count = ?, error_count = ? WHERE id = ?", (done, errors, task_id))
-        self.commit()
+        self.execute_and_commit("UPDATE tasks SET done_count = ?, error_count = ? WHERE id = ?", (done, errors, task_id))
 
     def count_tasks(self, project_id: int = None) -> int:
         if project_id:
@@ -291,13 +287,12 @@ class Database:
         return row[0] if row else 0
 
     def add_task_item(self, item: TaskItem) -> TaskItem:
-        cursor = self.execute(
+        cursor = self.execute_and_commit(
             """INSERT INTO task_items
                 (task_id, prompt, reference_image, start_frame, end_frame, status)
             VALUES (?, ?, ?, ?, ?, ?)""",
             (item.task_id, item.prompt, item.reference_image, item.start_frame, item.end_frame, item.status),
         )
-        self.commit()
         item.id = cursor.lastrowid
         return item
 
@@ -335,7 +330,7 @@ class Database:
         gen_account_id: int = None,
     ):
         completed = datetime.now().isoformat() if status == ItemStatus.COMPLETED else None
-        self.execute(
+        self.execute_and_commit(
             """UPDATE task_items SET
                 status=?,
                 output_path=COALESCE(?, output_path),
@@ -360,12 +355,10 @@ class Database:
                 item_id,
             ),
         )
-        self.commit()
 
     def get_setting(self, key: str) -> Optional[str]:
         row = self.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
         return row[0] if row else None
 
     def set_setting(self, key: str, value: str):
-        self.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
-        self.commit()
+        self.execute_and_commit("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))

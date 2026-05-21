@@ -30,10 +30,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+import asyncio
 from config.constants import ASPECT_RATIO_OPTIONS, DEFAULT_VIDEO_OUTPUT, QUALITY_OPTIONS, estimate_credits
+from services.flow_client import FlowClient
+from utils.logger import log
 from ui.widgets.image_grid import ImageGrid
 from utils.file_utils import generate_task_name
-from utils.logger import log
 
 
 IMG_MODE_REFERENCE = "Anh tham chieu"
@@ -55,33 +57,136 @@ class LongVideoWorker(QThread):
         self.account_pool = account_pool
         self.prompts = list(prompts or [])
         self.output_dir = Path(output_dir)
-        self.quality = quality
-        self.aspect_ratio = aspect_ratio
+        self.quality = quality or "Veo 3.1 - Fast"
+        self.aspect_ratio = aspect_ratio or "16:9"
         self.start_image = start_image
         self._cancelled = False
+        self._browser_mgr = getattr(parent, "_browser_mgr", None) if parent else None
 
     def cancel(self):
         self._cancelled = True
 
+    def _model_key(self):
+        q = self.quality
+        ar = self.aspect_ratio
+        orient = "portrait" if ar == "9:16" else "landscape"
+        if "Lite" in q and "Lower Priority" in q:
+            return f"veo_3_1_t2v_{orient}_lite_low_priority"
+        if "Lite" in q:
+            return f"veo_3_1_t2v_{orient}_lite"
+        if "Lower Priority" in q:
+            return f"veo_3_1_t2v_{orient}_fast_relaxed"
+        if "Quality" in q:
+            return f"veo_3_1_t2v_{orient}"
+        return f"veo_3_1_t2v_{orient}_fast"
+
     def run(self):
         try:
-            self.output_dir.mkdir(parents=True, exist_ok=True)
-            self.chain_started.emit(str(self.output_dir))
+            asyncio.run(self._run_async())
+        except Exception as e:
+            self.error.emit(str(e))
+
+    async def _run_async(self):
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.chain_started.emit(str(self.output_dir))
+
+        account = self.account_pool.acquire() if self.account_pool else None
+        if account is None or self._browser_mgr is None:
+            self.error.emit("No available Google account or browser manager")
+            return
+
+        try:
+            page = await self._browser_mgr.get_page(
+                account_id=account.id,
+                email=account.email,
+                proxy=account.proxy,
+                cookie_path=account.cookie_path,
+                url="https://labs.google/fx/tools/video-fx",
+            )
+            client = FlowClient(page, cookie_path=account.cookie_path, account_email=account.email)
+
             outputs = []
+            last_media_id = None
+            total = len(self.prompts)
+
             for index, prompt in enumerate(self.prompts, 1):
                 if self._cancelled:
                     self.progress.emit("Da dung")
                     return
-                self.scene_started.emit(index, len(self.prompts))
-                out = self.output_dir / f"scene_{index:03d}.txt"
-                out.write_text(prompt, encoding="utf-8")
-                outputs.append(str(out))
-                self.scene_done.emit(index, str(out))
-            final = self.output_dir / "long_video_outputs.txt"
-            final.write_text("\n".join(outputs), encoding="utf-8")
-            self.all_done.emit(str(final))
-        except Exception as e:
-            self.error.emit(str(e))
+                self.scene_started.emit(index, total)
+                out_path = self.output_dir / f"scene_{index:03d}.mp4"
+
+                try:
+                    if index == 1:
+                        image_paths = [self.start_image] if self.start_image and Path(self.start_image).exists() else None
+                        generation_id = await client.generate_video(
+                            prompt,
+                            image_paths=image_paths,
+                            model=self._model_key(),
+                            aspect_ratio=self.aspect_ratio,
+                        )
+                    else:
+                        if last_media_id:
+                            generation_id = await client.extend_video(
+                                last_media_id,
+                                prompt,
+                                aspect_ratio=self.aspect_ratio,
+                            )
+                        else:
+                            generation_id = await client.generate_video(
+                                prompt,
+                                model=self._model_key(),
+                                aspect_ratio=self.aspect_ratio,
+                            )
+
+                    if not generation_id:
+                        raise RuntimeError("No generation id returned")
+
+                    self.progress.emit(f"Canh {index}/{total}: dang tao...")
+                    result = await client.wait_for_completion(
+                        generation_id,
+                        cancel_check=lambda: self._cancelled,
+                    )
+
+                    if result.get("status") != "COMPLETED":
+                        raise RuntimeError(str(result.get("error") or result))
+
+                    media = result.get("media") or result.get("result") or {}
+                    media_id = media.get("name") or media.get("mediaId") or generation_id
+                    last_media_id = media_id
+
+                    ok = await client.download_video(media_id, out_path)
+                    if not ok:
+                        raise RuntimeError("Download failed")
+
+                    outputs.append(str(out_path))
+                    self.scene_done.emit(index, str(out_path))
+                    log.info(f"Long video scene {index}/{total} done: {out_path}")
+
+                except Exception as e:
+                    self.scene_failed.emit(index, str(e))
+                    log.error(f"Long video scene {index} failed: {e}")
+
+            if outputs:
+                try:
+                    from services.video_concat import concat_videos
+                    final_path = self.output_dir / "final_long_video.mp4"
+                    concat_videos(outputs, str(final_path))
+                    self.all_done.emit(str(final_path))
+                except Exception as e:
+                    log.warning(f"Concat failed, returning last scene: {e}")
+                    self.all_done.emit(outputs[-1])
+            else:
+                self.error.emit("No scenes completed")
+
+        finally:
+            if self.account_pool and account:
+                self.account_pool.release(account)
+            try:
+                if self._browser_mgr is not None and account is not None:
+                    await self._browser_mgr.close_context(account.id)
+            except Exception as e:
+                log.warning(f"Could not close browser context: {e}")
 
 
 class _PromptRow(QFrame):
@@ -183,6 +288,16 @@ class LongVideoPage(QWidget):
         self._init_ui()
 
     def _get_account_pool(self):
+        if self._account_pool is not None:
+            return self._account_pool
+        main_window = self.window()
+        getter = getattr(main_window, "_get_task_manager", None) if main_window is not None else None
+        if callable(getter):
+            try:
+                manager = getter()
+                self._account_pool = getattr(manager, "account_pool", None) if manager is not None else None
+            except Exception as e:
+                log.warning(f"Could not resolve account pool for LongVideoPage: {e}")
         return self._account_pool
 
     def _init_ui(self):

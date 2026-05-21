@@ -17,6 +17,7 @@ import base64
 import hashlib
 import json
 import os
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -72,6 +73,8 @@ class FlowClient:
     TRPC = "https://labs.google/fx/api/trpc"
     SESSION_URL = "https://labs.google/fx/api/auth/session"
     _caption_cache: dict[str, str] = {}
+    _caption_cache_lock = threading.Lock()
+    _CAPTION_CACHE_MAX = 200
     _IMAGE_MODEL_FALLBACK = {
         "Nano Banana Pro": "gemini-3-pro-image-preview",
         "Nano Banana 2": "gemini-3.1-flash-image-preview",
@@ -537,7 +540,8 @@ class FlowClient:
     async def _backbone_generate_caption(self, image_b64: str, category: str):
         """Call backbone.generateCaption tRPC to get a text description of an image."""
         img_hash = hashlib.md5(image_b64[:8192].encode()).hexdigest()
-        cached = FlowClient._caption_cache.get(img_hash)
+        with FlowClient._caption_cache_lock:
+            cached = FlowClient._caption_cache.get(img_hash)
         if cached:
             log.info(f"Backbone caption (cached): {cached[:80]}...")
             return cached
@@ -546,7 +550,13 @@ class FlowClient:
             result = await self._api("backbone.generateCaption", payload)
             data = self._extract(result) or result
             caption = data if isinstance(data, str) else data.get("caption") or data.get("prompt") or ""
-            FlowClient._caption_cache[img_hash] = caption
+            with FlowClient._caption_cache_lock:
+                if len(FlowClient._caption_cache) >= FlowClient._CAPTION_CACHE_MAX:
+                    try:
+                        FlowClient._caption_cache.pop(next(iter(FlowClient._caption_cache)))
+                    except StopIteration:
+                        pass
+                FlowClient._caption_cache[img_hash] = caption
             return caption
         except Exception as e:
             log.warning(f"Backbone caption failed: {e}")

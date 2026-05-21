@@ -360,6 +360,10 @@ class ScriptToPromptPage(QWidget):
         self.analyze_btn.setEnabled(False)
         self.cancel_btn.setEnabled(True)
         self.analyze_btn.setText("Đang phân tích...")
+        self._worker_signals = _WorkerSignals()
+        self._worker_signals.progress.connect(self._on_progress, type=Qt.ConnectionType.QueuedConnection)
+        self._worker_signals.finished.connect(self._on_finished, type=Qt.ConnectionType.QueuedConnection)
+        self._worker_signals.error.connect(self._on_error, type=Qt.ConnectionType.QueuedConnection)
         self.progress_bar.show()
         thread = threading.Thread(
             target=self._worker_thread,
@@ -372,10 +376,23 @@ class ScriptToPromptPage(QWidget):
         try:
             analyzer = self._analyzer or ScriptAnalyzer()
             self._analyzer = analyzer
-            result = asyncio.run(analyzer.analyze_script(script_text, num_scenes, self._load_api_key()))
-            self._on_finished(result)
+            result = asyncio.run(
+                analyzer.analyze_script(
+                    script_text,
+                    num_scenes,
+                    self._load_api_key(),
+                    style_preset_desc=style_preset_desc,
+                    style_lock=style_lock,
+                    global_context=global_context,
+                    character_aliases=character_aliases,
+                    voice_gender=voice_gender,
+                    auto_detect_scenes=auto_detect_scenes,
+                    progress_cb=lambda current, total, message: self._worker_signals.progress.emit(str(message)),
+                )
+            )
+            self._worker_signals.finished.emit(result)
         except Exception as e:
-            self._on_error(str(e))
+            self._worker_signals.error.emit(str(e))
 
     def _worker_thread_LEGACY_v1(self, url="", alias=""):
         return self._worker_thread(url)
