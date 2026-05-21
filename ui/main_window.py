@@ -476,8 +476,12 @@ class MainWindow(QMainWindow):
         return None
 
     def _on_task_progress(self, task_id, done, total):
+        # Try the page that owns this task first; fall back to current page.
         page = self._find_page_by_task(task_id)
         fn = getattr(page, "update_task_progress", None) if page else None
+        if not callable(fn):
+            page = self._get_current_content_page()
+            fn = getattr(page, "update_task_progress", None) if page else None
         if callable(fn):
             fn(task_id, done, total)
 
@@ -488,10 +492,21 @@ class MainWindow(QMainWindow):
             fn(item_id, status)
 
     def _on_item_completed(self, item_id, output_path):
-        self._on_item_status_changed(item_id, "COMPLETED")
+        page = self._get_current_content_page()
+        fn = getattr(page, "update_item_status", None) if page else None
+        if callable(fn):
+            fn(item_id, "COMPLETED", output_path)
 
     def _on_item_error(self, item_id, error):
-        self._on_item_status_changed(item_id, "ERROR")
+        page = self._get_current_content_page()
+        # Increment the page-level error counter (used in progress display).
+        on_err = getattr(page, "on_item_error", None) if page else None
+        if callable(on_err):
+            on_err(item_id, error)
+        else:
+            fn = getattr(page, "update_item_status", None) if page else None
+            if callable(fn):
+                fn(item_id, "ERROR")
 
     def _on_credit_updated(self, account_id, credit):
         self._refresh_account_headers()

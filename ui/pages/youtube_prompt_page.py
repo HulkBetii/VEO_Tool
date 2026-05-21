@@ -632,14 +632,77 @@ class YouTubePromptPage(QWidget):
             "concurrent": self.concurrent_spin.value(),
             "parallel_per_account": self.concurrent_spin.value(),
         }
-        self.status_label.setText(f"Đang tạo {len(prompts)} video… Xem log để theo dõi tiến trình.")
+        self._task_total = len(prompts)
+        self._task_done = 0
+        self._task_errors = 0
+        self.progress_bar.setRange(0, self._task_total)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat(f"0 / {self._task_total}")
+        self.progress_bar.show()
+        self.status_label.setText(f"Bắt đầu tạo {len(prompts)} video…")
         self.start_btn.setEnabled(False)
         self._btn_start_header.setEnabled(False)
+        # Reset all Status cells to "Chờ" so users can track live progress.
+        for r in range(self.table.rowCount()):
+            self._set_row_status(r, "Chờ", "#64748b")
         self.start_video_task.emit(config)
 
+    # ------------------------------------------------------------------
+    # Status / progress helpers (called from main_window via signals)
+    # ------------------------------------------------------------------
+
+    _STATUS_COLORS = {
+        "GENERATING":  "#fbbf24",   # amber  – đang render
+        "DOWNLOADING": "#f97316",   # orange – đang tải về
+        "COMPLETED":   "#22c55e",   # green  – xong
+        "DONE":        "#22c55e",
+        "ERROR":       "#f87171",   # red    – lỗi
+        "PENDING":     "#64748b",   # grey   – chờ
+        "Chờ":         "#64748b",
+        "Sẵn sàng":    "#94a3b8",
+    }
+
+    def _set_row_status(self, row: int, text: str, color: str | None = None):
+        """Update the Status cell (column 4) of a table row with optional color."""
+        if not (0 <= row < self.table.rowCount()):
+            return
+        cell = QTableWidgetItem(text)
+        if color is None:
+            color = self._STATUS_COLORS.get(text, "#dae2fd")
+        from PySide6.QtGui import QColor
+        cell.setForeground(QColor(color))
+        self.table.setItem(row, 4, cell)
+
     def update_item_status(self, row: int, status: str, output_path: str = ""):
-        if 0 <= row < self.table.rowCount():
-            self.table.setItem(row, 4, QTableWidgetItem(str(output_path or status)))
+        """Called by main_window._on_item_status_changed with (item_id, status)."""
+        label_map = {
+            "GENERATING":  "⏳ Đang tạo",
+            "DOWNLOADING": "⬇ Tải về",
+            "COMPLETED":   "✅ Xong",
+            "DONE":        "✅ Xong",
+            "ERROR":       "❌ Lỗi",
+            "PENDING":     "Chờ",
+        }
+        display = label_map.get(status, status)
+        if output_path:
+            from pathlib import Path as _Path
+            display = f"✅ {_Path(output_path).name}"
+        self._set_row_status(row, display, self._STATUS_COLORS.get(status))
+
+    def update_task_progress(self, task_id, done: int, total: int):
+        """Called by main_window._on_task_progress for each completed item."""
+        self._task_done = done
+        total = max(total, 1)
+        self.progress_bar.setRange(0, total)
+        self.progress_bar.setValue(done)
+        self.progress_bar.setFormat(f"{done} / {total}")
+        errors = getattr(self, "_task_errors", 0)
+        if errors:
+            self.status_label.setText(
+                f"Đang tạo video: {done}/{total} xong  •  {errors} lỗi"
+            )
+        else:
+            self.status_label.setText(f"Đang tạo video: {done}/{total} hoàn thành…")
 
     def _on_reset_all_to_ai(self):
         for row in range(self.table.rowCount()):
@@ -672,15 +735,39 @@ class YouTubePromptPage(QWidget):
         self._btn_extract_style.setEnabled(False)
         self.copy_btn.setEnabled(False)
         self.cancel_btn.setEnabled(False)
+        self.start_btn.setEnabled(True)
+        self._btn_start_header.setEnabled(True)
         self.status_label.setText("")
         self.progress_bar.hide()
         self.count_label.setText("0 cảnh")
+        self._task_total = 0
+        self._task_done = 0
+        self._task_errors = 0
+
+    def on_item_error(self, item_id: int, error: str):
+        """Called per-item error; tracks count and marks row red."""
+        self._task_errors = getattr(self, "_task_errors", 0) + 1
+        self._set_row_status(item_id, "❌ Lỗi", self._STATUS_COLORS.get("ERROR"))
 
     def on_task_finished(self, *args):
         self.start_btn.setEnabled(True)
         self._btn_start_header.setEnabled(True)
-        self.status_label.setText("Hoàn thành. Kiểm tra thư mục output.")
-        self.update_item_status(0, "DONE")
+        done   = getattr(self, "_task_done",   0)
+        total  = getattr(self, "_task_total",  0)
+        errors = getattr(self, "_task_errors", 0)
+        if total:
+            ok = done - errors
+            if errors:
+                self.status_label.setText(
+                    f"Hoàn thành: {ok}/{total} video thành công, {errors} lỗi."
+                )
+            else:
+                self.status_label.setText(
+                    f"Hoàn thành: {done}/{total} video. Kiểm tra thư mục output."
+                )
+        else:
+            self.status_label.setText("Hoàn thành. Kiểm tra thư mục output.")
+        self.progress_bar.hide()
 
     def _on_copy(self):
         prompts = self._get_prompts_from_table()
