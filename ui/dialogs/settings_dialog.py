@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QPlainTextEdit,
     QProgressDialog,
     QPushButton,
     QTabWidget,
@@ -156,8 +157,9 @@ class SettingsDialog(QDialog):
         self.theme_combo = QComboBox()
         self.theme_combo.addItems(["dark", "light"])
         self.theme_combo.setCurrentText(str(self.settings.get("theme", "dark")))
-        self.gemini_key_edit = QLineEdit(str(self.settings.get("gemini_api_key", "") or ""))
-        self.gemini_key_edit.setEchoMode(QLineEdit.Password)
+        self.gemini_key_edit = QPlainTextEdit(str(self.settings.get("gemini_api_key", "") or ""))
+        self.gemini_key_edit.setPlaceholderText("Mỗi dòng một Gemini API key")
+        self.gemini_key_edit.setMaximumHeight(96)
         self.auto_retry_check = QCheckBox("Tự retry tác vụ lỗi")
         self.auto_retry_check.setChecked(bool(self.settings.get("auto_retry_on_error", True)))
         guide_btn = QPushButton("Hướng dẫn lấy Gemini API key")
@@ -400,7 +402,7 @@ class SettingsDialog(QDialog):
 
     def _save_settings(self):
         self.settings.set("theme", self.theme_combo.currentText())
-        self.settings.set("gemini_api_key", self.gemini_key_edit.text().strip())
+        self.settings.set("gemini_api_key", self.gemini_key_edit.toPlainText().strip())
         self.settings.set("auto_retry_on_error", self.auto_retry_check.isChecked())
         self.accept()
 

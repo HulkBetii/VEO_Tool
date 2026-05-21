@@ -143,32 +143,41 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
         for page in self.pages.values():
-            for name, handler in (
-                ("start_task", self._on_start_task),
-                ("pause_task", self._on_pause_task),
-                ("stop_task", self._on_stop_task),
-                ("new_task", self._on_new_task),
-                ("retry_item", self._on_retry_item),
-                ("retry_all", self._on_retry_all),
-                ("concat_requested", self._on_concat),
-                ("youtube_start_video", self._on_youtube_start_video),
-                ("youtube_cancel", self._on_youtube_cancel),
-                ("youtube_retry_row", self._on_youtube_retry_row),
-                ("youtube_auto_start", self._on_youtube_auto_start),
-                ("youtube_send", self._on_youtube_send),
-                ("script_start_video", self._on_script_start_video),
-                ("script_cancel", self._on_script_cancel),
-                ("script_retry_row", self._on_script_retry_row),
-                ("script_send_single_prompt", self._on_script_send_single_prompt),
-                ("script_cancel_single_prompt", self._on_script_cancel_single_prompt),
-                ("upscale_image", self._on_upscale_image),
-            ):
-                sig = getattr(page, name, None)
-                if sig is not None:
-                    try:
-                        sig.connect(handler)
-                    except Exception:
-                        pass
+            self._connect_page_signals(page)
+            page_loaded = getattr(page, "page_loaded", None)
+            if page_loaded is not None:
+                try:
+                    page_loaded.connect(self._connect_page_signals)
+                except Exception:
+                    pass
+
+    def _connect_page_signals(self, page):
+        for name, handler in (
+            ("start_task", self._on_start_task),
+            ("pause_task", self._on_pause_task),
+            ("stop_task", self._on_stop_task),
+            ("new_task", self._on_new_task),
+            ("retry_item", self._on_retry_item),
+            ("retry_all", self._on_retry_all),
+            ("concat_requested", self._on_concat),
+            ("youtube_start_video", self._on_youtube_start_video),
+            ("youtube_cancel", self._on_youtube_cancel),
+            ("youtube_retry_row", self._on_youtube_retry_row),
+            ("youtube_auto_start", self._on_youtube_auto_start),
+            ("youtube_send", self._on_youtube_send),
+            ("script_start_video", self._on_script_start_video),
+            ("script_cancel", self._on_script_cancel),
+            ("script_retry_row", self._on_script_retry_row),
+            ("script_send_single_prompt", self._on_script_send_single_prompt),
+            ("script_cancel_single_prompt", self._on_script_cancel_single_prompt),
+            ("upscale_image", self._on_upscale_image),
+        ):
+            sig = getattr(page, name, None)
+            if sig is not None:
+                try:
+                    sig.connect(handler)
+                except Exception:
+                    pass
 
     def _get_task_manager(self):
         if self.task_manager is None:
@@ -314,7 +323,8 @@ class MainWindow(QMainWindow):
             return manager.stop_task(task_id)
 
     def _on_youtube_start_video(self, payload):
-        return self._do_youtube_start(payload, self.pages.get("youtube"))
+        self._do_youtube_start(payload, self.pages.get("youtube"))
+        return self._on_start_task(payload)
 
     def _do_youtube_start(self, payload, page=None):
         try:
@@ -347,7 +357,8 @@ class MainWindow(QMainWindow):
         return self._on_start_task(payload)
 
     def _on_script_start_video(self, payload):
-        return self._do_script_start(payload, self.pages.get("script"))
+        self._do_script_start(payload, self.pages.get("script"))
+        return self._on_start_task(payload)
 
     def _do_script_start(self, payload, page=None):
         try:
@@ -434,9 +445,32 @@ class MainWindow(QMainWindow):
 
     def _on_task_completed(self, task_id):
         log.info(f"Task completed: {task_id}")
+        page = self._get_current_content_page()
+        fn = getattr(page, "on_task_finished", None)
+        if callable(fn):
+            try:
+                fn(task_id)
+            except Exception:
+                pass
 
     def _on_task_error(self, task_id, error):
         log.warning(f"Task error {task_id}: {error}")
+        # Re-enable action buttons on the active page.
+        page = self._get_current_content_page()
+        fn = getattr(page, "on_task_finished", None)
+        if callable(fn):
+            try:
+                fn()
+            except Exception:
+                pass
+        # Surface critical configuration errors that would otherwise be silent.
+        if "No enabled Google account" in str(error):
+            QMessageBox.warning(
+                self,
+                "Lỗi tài khoản",
+                "Không có tài khoản Google nào khả dụng.\n"
+                "Vui lòng thêm và xác thực tài khoản trong mục Cài đặt.",
+            )
 
     def _cleanup_script_extra_task(self, task_id):
         return None
@@ -464,6 +498,10 @@ class MainWindow(QMainWindow):
 
     def _get_current_content_page(self):
         widget = self.stack.currentWidget()
+        # Unwrap LazyPage so callers get the real page widget (with actual slots).
+        real = getattr(widget, "real", None)
+        if real is not None:
+            return real
         return widget
 
     def _find_page_by_task(self, task_id):

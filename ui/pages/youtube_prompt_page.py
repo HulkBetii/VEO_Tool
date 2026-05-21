@@ -7,7 +7,7 @@ import threading
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QTimer, Qt, Signal
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -92,18 +92,24 @@ class YouTubePromptPage(QWidget):
         self._concat_error_signal.connect(self._on_concat_error)
 
     def _load_api_key(self):
-        if self._session_api_key:
-            return self._session_api_key
-        if self._db:
+        if not hasattr(self, "_api_keys"):
+            self._api_keys = []
+            self._api_key_index = 0
+        if not self._api_keys and self._db:
             from config.settings import Settings
 
-            key = Settings(self._db).get("gemini_api_key", "") or ""
-            self._session_api_key = key
-            return key
-        return ""
+            raw_value = Settings(self._db).get("gemini_api_key", "") or ""
+            self._api_keys = [line.strip() for line in str(raw_value).splitlines() if line.strip()]
+        if not self._api_keys:
+            return ""
+        key = self._api_keys[self._api_key_index % len(self._api_keys)]
+        self._api_key_index += 1
+        return key
 
     def _clear_session_secrets(self):
         self._session_api_key = None
+        self._api_keys = []
+        self._api_key_index = 0
 
     def hideEvent(self, event):
         self._clear_session_secrets()
@@ -274,7 +280,9 @@ class YouTubePromptPage(QWidget):
         out_row.addWidget(browse)
         ll.addLayout(out_row)
 
-        act_row = QHBoxLayout()
+        primary_row = QHBoxLayout()
+        secondary_row = QHBoxLayout()
+        utility_row = QHBoxLayout()
         self.analyze_btn = QPushButton("Phân tích")
         self._btn_suggest_ctx = QPushButton("Gợi ý context")
         self.start_btn = QPushButton("Bắt đầu tạo video")
@@ -283,18 +291,33 @@ class YouTubePromptPage(QWidget):
         self.reset_btn = QPushButton("Reset")
         self.reset_to_ai_btn = QPushButton("Reset về AI")
         self._btn_concat = QPushButton("Nối video")
-        for btn in (
-            self.analyze_btn,
-            self._btn_suggest_ctx,
-            self.start_btn,
-            self.copy_btn,
-            self.cancel_btn,
-            self.reset_btn,
-            self.reset_to_ai_btn,
-            self._btn_concat,
-        ):
-            act_row.addWidget(btn)
-        ll.addLayout(act_row)
+        self.start_btn.setMinimumHeight(36)
+        # Inline style so it overrides the page's transparent-background rule and
+        # always renders as a clearly-clickable primary action button.
+        _start_btn_qss = (
+            "QPushButton {"
+            "  background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #4d8eff,stop:1 #3b82f6);"
+            "  color: #ffffff; font-weight: bold; font-size: 14px;"
+            "  border: none; border-radius: 6px;"
+            "}"
+            "QPushButton:hover {"
+            "  background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #6ba1ff,stop:1 #4d8eff);"
+            "}"
+            "QPushButton:pressed { background-color: #2563eb; }"
+            "QPushButton:disabled { background-color: #1a2240; color: #424754; }"
+        )
+        self.start_btn.setStyleSheet(_start_btn_qss)
+        primary_row.addWidget(self.analyze_btn)
+        primary_row.addWidget(self._btn_suggest_ctx)
+        secondary_row.addWidget(self.start_btn)
+        secondary_row.addWidget(self.cancel_btn)
+        utility_row.addWidget(self.copy_btn)
+        utility_row.addWidget(self.reset_btn)
+        utility_row.addWidget(self.reset_to_ai_btn)
+        utility_row.addWidget(self._btn_concat)
+        ll.addLayout(primary_row)
+        ll.addLayout(secondary_row)
+        ll.addLayout(utility_row)
 
         self.analyze_btn.clicked.connect(self._on_analyze)
         self._btn_suggest_ctx.clicked.connect(self._on_suggest_context)
@@ -328,12 +351,17 @@ class YouTubePromptPage(QWidget):
         rl.setSpacing(10)
         head = QHBoxLayout()
         self.count_label = QLabel("0 cảnh")
+        self._btn_start_header = QPushButton("Tạo video")
+        self._btn_start_header.setMinimumHeight(32)
+        self._btn_start_header.setStyleSheet(_start_btn_qss)
+        self._btn_start_header.clicked.connect(self._on_start)
         self._btn_copy_json = QPushButton("Copy JSON")
         self._btn_copy_json.clicked.connect(self._on_copy_json)
         self._btn_load_more = QPushButton("Tải thêm cảnh")
         self._btn_load_more.clicked.connect(self._on_load_more_scenes)
         head.addWidget(self.count_label)
         head.addStretch()
+        head.addWidget(self._btn_start_header)
         head.addWidget(self._btn_copy_json)
         head.addWidget(self._btn_load_more)
         rl.addLayout(head)
@@ -364,6 +392,11 @@ class YouTubePromptPage(QWidget):
 
         splitter.addWidget(right)
         splitter.setSizes([430, 980])
+
+        self._start_shortcut = QShortcut(QKeySequence("Ctrl+Return"), self)
+        self._start_shortcut.activated.connect(self._on_start)
+        self._start_shortcut_mac = QShortcut(QKeySequence("Meta+Return"), self)
+        self._start_shortcut_mac.activated.connect(self._on_start)
 
     def _label(self, text):
         return QLabel(str(text))
@@ -568,6 +601,25 @@ class YouTubePromptPage(QWidget):
 
     def _on_start(self):
         prompts = self._get_prompts_from_table()
+        if not prompts:
+            self.status_label.setText("Chưa có prompt nào — hãy phân tích YouTube trước.")
+            return
+
+        # Pre-flight: require at least one enabled Google account.
+        if self._db:
+            try:
+                accounts = self._db.get_accounts(enabled_only=True)
+            except Exception:
+                accounts = []
+            if not accounts:
+                QMessageBox.warning(
+                    self,
+                    "Chưa có tài khoản",
+                    "Chưa cấu hình tài khoản Google nào.\n"
+                    "Vui lòng thêm tài khoản trong mục Cài đặt.",
+                )
+                return
+
         char_images = self.image_grid.get_images() if hasattr(self, "image_grid") else {}
         mode = "char_video" if char_images else "video_plain"
         config = {
@@ -580,6 +632,9 @@ class YouTubePromptPage(QWidget):
             "concurrent": self.concurrent_spin.value(),
             "parallel_per_account": self.concurrent_spin.value(),
         }
+        self.status_label.setText(f"Đang tạo {len(prompts)} video… Xem log để theo dõi tiến trình.")
+        self.start_btn.setEnabled(False)
+        self._btn_start_header.setEnabled(False)
         self.start_video_task.emit(config)
 
     def update_item_status(self, row: int, status: str, output_path: str = ""):
@@ -622,6 +677,9 @@ class YouTubePromptPage(QWidget):
         self.count_label.setText("0 cảnh")
 
     def on_task_finished(self, *args):
+        self.start_btn.setEnabled(True)
+        self._btn_start_header.setEnabled(True)
+        self.status_label.setText("Hoàn thành. Kiểm tra thư mục output.")
         self.update_item_status(0, "DONE")
 
     def _on_copy(self):

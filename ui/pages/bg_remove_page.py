@@ -161,7 +161,7 @@ class BgRemovePage(QWidget):
                     except Exception:
                         continue
                     if value:
-                        return str(value)
+                        return next((line.strip() for line in str(value).splitlines() if line.strip()), "")
         return ""
 
     def _init_ui(self):

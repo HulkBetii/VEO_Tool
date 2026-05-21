@@ -97,18 +97,24 @@ class ScriptToPromptPage(QWidget):
         self._concat_error_signal.connect(self._on_concat_error)
 
     def _load_api_key(self):
-        if self._session_api_key:
-            return self._session_api_key
-        if self._db:
+        if not hasattr(self, "_api_keys"):
+            self._api_keys = []
+            self._api_key_index = 0
+        if not self._api_keys and self._db:
             from config.settings import Settings
 
-            key = Settings(self._db).get("gemini_api_key", "") or ""
-            self._session_api_key = key
-            return key
-        return ""
+            raw_value = Settings(self._db).get("gemini_api_key", "") or ""
+            self._api_keys = [line.strip() for line in str(raw_value).splitlines() if line.strip()]
+        if not self._api_keys:
+            return ""
+        key = self._api_keys[self._api_key_index % len(self._api_keys)]
+        self._api_key_index += 1
+        return key
 
     def _clear_session_secrets(self):
         self._session_api_key = None
+        self._api_keys = []
+        self._api_key_index = 0
 
     def hideEvent(self, event):
         self._clear_session_secrets()
@@ -261,16 +267,25 @@ class ScriptToPromptPage(QWidget):
         out_row.addWidget(browse)
         ll.addLayout(out_row)
 
-        act_row = QHBoxLayout()
+        primary_row = QHBoxLayout()
+        secondary_row = QHBoxLayout()
+        utility_row = QHBoxLayout()
         self.analyze_btn = QPushButton("Phân tích")
         self.start_btn = QPushButton("Bắt đầu tạo video")
         self.copy_btn = QPushButton("Copy prompts")
         self.cancel_btn = QPushButton("Dừng")
         self.reset_btn = QPushButton("Reset")
         self._btn_concat = QPushButton("Nối video")
-        for btn in (self.analyze_btn, self.start_btn, self.copy_btn, self.cancel_btn, self.reset_btn, self._btn_concat):
-            act_row.addWidget(btn)
-        ll.addLayout(act_row)
+        self.start_btn.setMinimumHeight(36)
+        primary_row.addWidget(self.analyze_btn)
+        primary_row.addWidget(self.start_btn)
+        secondary_row.addWidget(self.copy_btn)
+        secondary_row.addWidget(self.cancel_btn)
+        utility_row.addWidget(self.reset_btn)
+        utility_row.addWidget(self._btn_concat)
+        ll.addLayout(primary_row)
+        ll.addLayout(secondary_row)
+        ll.addLayout(utility_row)
         self.analyze_btn.clicked.connect(self._on_analyze)
         self.start_btn.clicked.connect(self._on_start)
         self.copy_btn.clicked.connect(self._on_copy)

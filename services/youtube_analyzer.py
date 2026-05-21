@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Callable, Optional
@@ -123,10 +124,9 @@ SHOT_SCHEMA = {
 
 
 def _safe_imwrite(path, frame, params=None):
-    import cv2 as _cv2
-
     ext = os.path.splitext(path)[1] or ".jpg"
     try:
+        import cv2 as _cv2
         ok, buf = _cv2.imencode(ext, frame, params or [])
         if not ok:
             log.warning(f"[safe_imwrite] cv2.imencode({ext}) returned False")
@@ -134,6 +134,16 @@ def _safe_imwrite(path, frame, params=None):
         with open(path, "wb") as f:
             f.write(buf.tobytes())
         return True
+    except ImportError:
+        try:
+            from PIL import Image as _Image
+            import numpy as _np
+            img = _Image.fromarray(frame[..., ::-1] if frame.ndim == 3 else frame)
+            img.save(path)
+            return True
+        except Exception as e:
+            log.warning(f"[safe_imwrite] PIL fallback failed: {e}")
+            return False
     except Exception as e:
         log.warning(f"[safe_imwrite] write to {path} failed: {e}")
         return False
@@ -432,6 +442,45 @@ class YouTubeAnalyzer:
             shutil.rmtree(self._temp_dir, ignore_errors=True)
             self._temp_dir = None
 
+    def _yt_dlp_cmd(self):
+        """Return a runnable yt-dlp command prefix.
+
+        GUI apps on macOS often launch without Homebrew paths in PATH, so
+        shutil.which("yt-dlp") may fail even when /opt/homebrew/bin/yt-dlp exists.
+        """
+        candidates = []
+        env_path = os.environ.get("NAVTOOLS_YT_DLP")
+        if env_path:
+            candidates.append(Path(env_path))
+        found = shutil.which("yt-dlp")
+        if found:
+            candidates.append(Path(found))
+        base_dir = Path(__file__).resolve().parents[1]
+        candidates.extend(
+            [
+                base_dir / "yt-dlp",
+                base_dir / "yt-dlp.exe",
+                base_dir / "bin" / "yt-dlp",
+                base_dir / "bin" / "yt-dlp.exe",
+                Path("/opt/homebrew/bin/yt-dlp"),
+                Path("/usr/local/bin/yt-dlp"),
+            ]
+        )
+        for candidate in candidates:
+            if candidate and candidate.exists():
+                return [str(candidate)]
+        try:
+            import importlib.util
+
+            if importlib.util.find_spec("yt_dlp") is not None:
+                return [sys.executable, "-m", "yt_dlp"]
+        except Exception:
+            pass
+        raise RuntimeError(
+            "Không tìm thấy yt-dlp. Cài bằng: brew install yt-dlp hoặc pip install yt-dlp. "
+            "Nếu đã cài, đặt biến NAVTOOLS_YT_DLP trỏ tới file yt-dlp."
+        )
+
     async def download(self, url, progress_cb=None):
         self._setup_cache_for(url)
         cached = self._cache_dir / "video.mp4" if self._cache_dir else None
@@ -446,31 +495,42 @@ class YouTubeAnalyzer:
             return str(cached), meta.get("title", ""), float(meta.get("duration", 0) or 0)
 
         output = str(Path(self.temp_dir) / "video.%(ext)s")
-        cmd = [
-            "yt-dlp",
-            "-f",
-            "bv*[height<=720]+ba/b[height<=720]/best",
-            "--merge-output-format",
-            "mp4",
+        yt_dlp = self._yt_dlp_cmd()
+        common_args = [
+            "--merge-output-format", "mp4",
             "--no-playlist",
-            "-o",
-            output,
-            url,
+            "--no-update",
+            "-o", output,
             "--print-json",
+        ]
+        # Download strategies ordered by reliability.
+        # YouTube SABR may block separate-stream formats for some clients,
+        # so we try multiple client/format combos and stop at the first success.
+        strategies = [
+            {"format": "bv*[height<=720]+ba/b[height<=720]/best", "extra": []},
+            {"format": "b[height<=720]/best", "extra": ["--extractor-args", "youtube:player_client=android"]},
+            {"format": "18/b/best", "extra": ["--extractor-args", "youtube:player_client=android"]},
         ]
         if progress_cb:
             progress_cb("Downloading video...")
-        proc = await asyncio.to_thread(
-            subprocess.run,
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="ignore",
-            creationflags=get_subprocess_flags(),
-        )
-        if proc.returncode != 0:
-            raise RuntimeError(proc.stderr.strip() or "yt-dlp download failed")
+        proc = None
+        for strategy in strategies:
+            cmd = yt_dlp + strategy["extra"] + common_args + ["-f", strategy["format"], url]
+            proc = await asyncio.to_thread(
+                subprocess.run,
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                creationflags=get_subprocess_flags(),
+            )
+            if proc.returncode == 0:
+                break
+            log.warning(f"yt-dlp strategy {strategy!r} failed (rc={proc.returncode}), trying next...")
+        if proc is None or proc.returncode != 0:
+            stderr = (proc.stderr.strip() if proc else "") or "yt-dlp download failed"
+            raise RuntimeError(stderr)
 
         info = {}
         for line in proc.stdout.splitlines()[::-1]:
@@ -524,29 +584,60 @@ class YouTubeAnalyzer:
         return scenes[:target_count]
 
     def _detect_scenes_ffmpeg(self, video_path, duration=None, progress_cb=None):
-        import cv2
-
-        cap = cv2.VideoCapture(str(video_path))
-        if not cap.isOpened():
-            raise RuntimeError("Cannot open video for scene extraction")
-        fps = cap.get(cv2.CAP_PROP_FPS) or 25
-        frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
-        total = float(duration or (frame_count / fps if fps else 0))
+        total = float(duration or 0)
         count = _max_scenes_for_duration(total)
         scenes = []
         frames_dir = Path(self.temp_dir) / "frames"
         frames_dir.mkdir(parents=True, exist_ok=True)
-        for i in range(count):
-            start = i * VEO_VIDEO_LENGTH
-            end = min(total or start + VEO_VIDEO_LENGTH, start + VEO_VIDEO_LENGTH)
-            mid = (start + end) / 2
-            cap.set(cv2.CAP_PROP_POS_MSEC, mid * 1000)
-            ok, frame = cap.read()
-            keyframe = frames_dir / f"scene_{i + 1:03d}.jpg"
-            if ok:
-                _safe_imwrite(str(keyframe), frame)
-            scenes.append({"scene_num": i + 1, "start": start, "end": end, "keyframe": str(keyframe)})
-        cap.release()
+
+        try:
+            import cv2
+            _have_cv2 = True
+        except ImportError:
+            _have_cv2 = False
+            log.info("cv2 not available — using ffmpeg for keyframe extraction")
+
+        if _have_cv2:
+            cap = cv2.VideoCapture(str(video_path))
+            if not cap.isOpened():
+                raise RuntimeError("Cannot open video for scene extraction")
+            fps = cap.get(cv2.CAP_PROP_FPS) or 25
+            frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+            if not total:
+                total = frame_count / fps if fps else 0
+            count = _max_scenes_for_duration(total)
+            for i in range(count):
+                start = i * VEO_VIDEO_LENGTH
+                end = min(total or start + VEO_VIDEO_LENGTH, start + VEO_VIDEO_LENGTH)
+                mid = (start + end) / 2
+                cap.set(cv2.CAP_PROP_POS_MSEC, mid * 1000)
+                ok, frame = cap.read()
+                keyframe = frames_dir / f"scene_{i + 1:03d}.jpg"
+                if ok:
+                    _safe_imwrite(str(keyframe), frame)
+                scenes.append({"scene_num": i + 1, "start": start, "end": end, "keyframe": str(keyframe)})
+            cap.release()
+        else:
+            ffmpeg = str(FFMPEG_PATH) if FFMPEG_PATH else "ffmpeg"
+            for i in range(count):
+                start = i * VEO_VIDEO_LENGTH
+                end = min(total or start + VEO_VIDEO_LENGTH, start + VEO_VIDEO_LENGTH)
+                mid = (start + end) / 2
+                keyframe = frames_dir / f"scene_{i + 1:03d}.jpg"
+                cmd = [
+                    ffmpeg, "-y", "-ss", str(mid), "-i", str(video_path),
+                    "-vframes", "1", "-q:v", "2", str(keyframe),
+                ]
+                try:
+                    subprocess.run(
+                        cmd,
+                        capture_output=True,
+                        timeout=30,
+                        creationflags=get_subprocess_flags(),
+                    )
+                except Exception as e:
+                    log.warning(f"ffmpeg keyframe {i+1} failed: {e}")
+                scenes.append({"scene_num": i + 1, "start": start, "end": end, "keyframe": str(keyframe)})
         return scenes
 
     @classmethod
