@@ -129,6 +129,37 @@ def _emit_fallback_metric(from_model: str, to_model: str, error_type: str) -> No
         return None
 
 
-async def agenerate_with_fallback(client: genai.Client, **kwargs: Any) -> Any:
-    """Async: same as `generate_with_fallback` via `asyncio.to_thread`."""
-    return await asyncio.to_thread(generate_with_fallback, client, **kwargs)
+async def agenerate_with_fallback(client_or_prompt: "genai.Client | str", api_key: str | None = None, **kwargs: Any) -> Any:
+    """Async: try each model in MODEL_CHAIN.
+
+    Supports two calling conventions:
+
+    **New** (preferred)::
+
+        client = genai.Client(api_key="...")
+        resp = await agenerate_with_fallback(client, contents="...", config=...)
+        text = resp.text
+
+    **Legacy** (used by ``youtube_analyzer.py``)::
+
+        text = await agenerate_with_fallback(prompt_str, api_key="KEY")
+        # Returns a plain string so callers can do  str(raw).strip()
+    """
+    if isinstance(client_or_prompt, str):
+        # ── Legacy path ──────────────────────────────────────────────────────
+        # First arg is the prompt text; api_key is passed as a keyword arg.
+        if not api_key:
+            raise ValueError(
+                "agenerate_with_fallback: api_key is required when the first "
+                "argument is a prompt string, not a genai.Client instance."
+            )
+        _client = genai.Client(api_key=api_key)
+        resp = await asyncio.to_thread(
+            generate_with_fallback, _client, contents=client_or_prompt, **kwargs
+        )
+        # Legacy callers use  str(raw).strip()  or  json.loads(raw) — return text.
+        return resp.text if hasattr(resp, "text") else str(resp)
+
+    # ── New path ──────────────────────────────────────────────────────────────
+    # First arg is already a genai.Client instance.
+    return await asyncio.to_thread(generate_with_fallback, client_or_prompt, **kwargs)

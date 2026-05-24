@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QTimer, Qt, Signal
@@ -29,7 +31,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from config.constants import DEFAULT_VIDEO_OUTPUT
+from config.constants import DEFAULT_VIDEO_OUTPUT, ItemStatus, TaskMode, TaskStatus
+from models.task import TaskItem, VideoTask
 from services.youtube_analyzer import DEFAULT_STYLE_PRESET, STYLE_PRESETS, YouTubeAnalyzer, assemble_prompt
 from ui.widgets.image_grid import ImageGrid
 from utils.logger import log
@@ -87,6 +90,8 @@ class YouTubePromptPage(QWidget):
         self._warnings = []
         self._style_lock_original = STYLE_PRESETS.get(DEFAULT_STYLE_PRESET, "")
         self._ref_image_paths = []
+        self.task_id = None
+        self._item_row_by_id = {}
         self._init_ui()
         self._concat_done_signal.connect(self._on_concat_done)
         self._concat_error_signal.connect(self._on_concat_error)
@@ -123,7 +128,38 @@ class YouTubePromptPage(QWidget):
         if not url:
             self.status_label.setText("Nhap URL YouTube truoc.")
             return
-        self._on_suggestion_ready(f"Context from URL: {url}")
+        if not self._results:
+            self.status_label.setText("Hãy phân tích YouTube trước khi gợi ý context.")
+            return
+        api_key = self._load_api_key()
+        if not api_key:
+            self.status_label.setText("Chưa cấu hình Gemini API key.")
+            return
+        self._btn_suggest_ctx.setEnabled(False)
+        self.status_label.setText("Đang gợi ý context...")
+        signals = _WorkerSignals()
+        signals.finished.connect(lambda text: self._on_suggestion_finished(text), type=Qt.ConnectionType.QueuedConnection)
+        signals.error.connect(lambda error: self._on_suggestion_error(error), type=Qt.ConnectionType.QueuedConnection)
+        transcript = "\n".join(str(item.get("transcript", "")).strip() for item in self._results if isinstance(item, dict))
+        title = str((self._last_state or {}).get("title") or url)
+        thread = threading.Thread(target=self._suggest_context_thread, args=(title, transcript, api_key, signals), daemon=True)
+        thread.start()
+
+    def _suggest_context_thread(self, title: str, transcript: str, api_key: str, signals: _WorkerSignals):
+        try:
+            analyzer = self._analyzer or YouTubeAnalyzer()
+            text = asyncio.run(analyzer.suggest_global_context(title, transcript, api_key))
+            signals.finished.emit(text)
+        except Exception as e:
+            signals.error.emit(str(e))
+
+    def _on_suggestion_finished(self, text):
+        self._btn_suggest_ctx.setEnabled(True)
+        self._on_suggestion_ready(text)
+
+    def _on_suggestion_error(self, error):
+        self._btn_suggest_ctx.setEnabled(True)
+        self.status_label.setText(f"Lỗi gợi ý context: {error}")
 
     def _on_suggestion_ready(self, text):
         self.global_context_edit.setPlainText(str(text or ""))
@@ -357,8 +393,23 @@ class YouTubePromptPage(QWidget):
         self._btn_start_header.clicked.connect(self._on_start)
         self._btn_copy_json = QPushButton("Copy JSON")
         self._btn_copy_json.clicked.connect(self._on_copy_json)
+        # Inline style so the page's "QWidget { background: transparent }" rule
+        # doesn't wipe out the button background (same reason as start_btn).
+        _secondary_btn_qss = (
+            "QPushButton {"
+            "  background: #1e3a5f; color: #93c5fd;"
+            "  border: 1px solid #2563eb; border-radius: 5px;"
+            "  padding: 4px 10px; font-size: 12px;"
+            "}"
+            "QPushButton:hover { background: #1d4ed8; color: #ffffff; }"
+            "QPushButton:pressed { background: #1e40af; }"
+            "QPushButton:disabled { background: #111827; color: #374151; border-color: #1f2937; }"
+        )
+        self._btn_copy_json.setStyleSheet(_secondary_btn_qss)
         self._btn_load_more = QPushButton("Tải thêm cảnh")
         self._btn_load_more.clicked.connect(self._on_load_more_scenes)
+        self._btn_copy_json.setEnabled(False)
+        self._btn_load_more.setEnabled(False)
         head.addWidget(self.count_label)
         head.addStretch()
         head.addWidget(self._btn_start_header)
@@ -472,16 +523,27 @@ class YouTubePromptPage(QWidget):
         self._restore_analyze_button()
         scenes = result.get("scenes", result.get("captions", [])) if isinstance(result, dict) else result
         self._results = list(scenes or [])
+        if isinstance(result, dict):
+            self._save_analyze_state(
+                title=result.get("title", ""),
+                duration=result.get("duration", 0),
+                global_context=result.get("global_context", ""),
+            )
         self.table.setRowCount(0)
         for row, item in enumerate(self._results):
             self._populate_row(row, item)
         self.count_label.setText(f"{len(self._results)} cảnh")
         self.status_label.setText("Phân tích xong.")
         self.copy_btn.setEnabled(bool(self._results))
+        self._btn_copy_json.setEnabled(bool(self._results))
+        self._btn_load_more.setEnabled(bool(self._results))
         self._refresh_credit_labels()
 
     def _on_load_more_scenes(self):
-        self._on_analyze()
+        if not self._last_state:
+            self.status_label.setText("Hãy phân tích YouTube trước khi tải thêm cảnh.")
+            return
+        self.status_label.setText("Video đã được chia theo mốc 8 giây; hiện chưa còn cảnh để tải thêm.")
 
     def _populate_row(self, row: int, item: dict):
         self.table.insertRow(row)
@@ -592,7 +654,67 @@ class YouTubePromptPage(QWidget):
             self.send_single_prompt.emit({"prompts": [item.text().strip()]})
 
     def _on_copy_json(self):
-        QApplication.clipboard().setText(str(self._get_prompts_from_table()))
+        rows = []
+        for row in range(self.table.rowCount()):
+            rows.append(
+                {
+                    "scene_num": self.table.item(row, 0).text() if self.table.item(row, 0) else row + 1,
+                    "time": self.table.item(row, 1).text() if self.table.item(row, 1) else "",
+                    "transcript": self.table.item(row, 2).text() if self.table.item(row, 2) else "",
+                    "prompt": self.table.item(row, 3).text() if self.table.item(row, 3) else "",
+                }
+            )
+        QApplication.clipboard().setText(json.dumps(rows, ensure_ascii=False, indent=2))
+        self.status_label.setText("Đã copy JSON hợp lệ.")
+
+    def _build_video_task(self, prompts, char_images, mode):
+        if not self._db:
+            return {
+                "id": 0,
+                "prompts": prompts,
+                "quality": self.quality_combo.currentText(),
+                "aspect_ratio": self.ar_combo.currentData() or self.ar_combo.currentText(),
+                "output_folder": self.output_edit.text().strip(),
+                "character_images": char_images,
+                "mode": mode,
+                "concurrent": self.concurrent_spin.value(),
+                "parallel_per_account": self.concurrent_spin.value(),
+            }
+        project = self._db.get_or_create_project("YouTube → Prompt", self.output_edit.text().strip())
+        task = VideoTask(
+            project_id=project.id,
+            name=f"YouTube Prompt {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            mode=mode,
+            quality=self.quality_combo.currentText(),
+            aspect_ratio=self.ar_combo.currentData() or self.ar_combo.currentText(),
+            concurrent=self.concurrent_spin.value(),
+            parallel_per_account=self.concurrent_spin.value(),
+            character_images=list(char_images.values()) if isinstance(char_images, dict) else list(char_images or []),
+            output_folder=self.output_edit.text().strip(),
+            status=TaskStatus.PENDING,
+            total_count=len(prompts),
+        )
+        task = self._db.create_task(task)
+        task.items = []
+        self._item_row_by_id = {}
+        for row, prompt in enumerate(prompts):
+            item = self._db.add_task_item(TaskItem(task_id=task.id, prompt=prompt, status=ItemStatus.PENDING))
+            task.items.append(item)
+            self._item_row_by_id[item.id] = row
+        return task
+
+    def _dispatch_start_task(self, task):
+        task_id = task.id if hasattr(task, "id") else task.get("id", 0)
+        if isinstance(task, dict):
+            total = len(task.get("items") or task.get("prompts") or [])
+        else:
+            total = len(getattr(task, "items", None) or [])
+        log.info(f"YouTubePromptPage dispatch start task_id={task_id} total={total}")
+        handler = getattr(self.window(), "_on_youtube_start_video", None)
+        if callable(handler):
+            handler(task)
+            return
+        self.start_video_task.emit(task)
 
     def _browse_output(self):
         folder = QFileDialog.getExistingDirectory(self, "Chọn thư mục output")
@@ -621,17 +743,14 @@ class YouTubePromptPage(QWidget):
                 return
 
         char_images = self.image_grid.get_images() if hasattr(self, "image_grid") else {}
-        mode = "char_video" if char_images else "video_plain"
-        config = {
-            "prompts": prompts,
-            "quality": self.quality_combo.currentText(),
-            "aspect_ratio": self.ar_combo.currentData() or self.ar_combo.currentText(),
-            "output_folder": self.output_edit.text().strip(),
-            "character_images": char_images,
-            "mode": mode,
-            "concurrent": self.concurrent_spin.value(),
-            "parallel_per_account": self.concurrent_spin.value(),
-        }
+        mode = TaskMode.CHAR_VIDEO if char_images else TaskMode.VIDEO_PLAIN
+        try:
+            task = self._build_video_task(prompts, char_images, mode)
+        except Exception as e:
+            self.status_label.setText(f"Không tạo được task: {e}")
+            QMessageBox.warning(self, "Tạo video", str(e))
+            return
+        self.task_id = task.id if hasattr(task, "id") else task.get("id")
         self._task_total = len(prompts)
         self._task_done = 0
         self._task_errors = 0
@@ -645,7 +764,7 @@ class YouTubePromptPage(QWidget):
         # Reset all Status cells to "Chờ" so users can track live progress.
         for r in range(self.table.rowCount()):
             self._set_row_status(r, "Chờ", "#64748b")
-        self.start_video_task.emit(config)
+        self._dispatch_start_task(task)
 
     # ------------------------------------------------------------------
     # Status / progress helpers (called from main_window via signals)
@@ -675,6 +794,7 @@ class YouTubePromptPage(QWidget):
 
     def update_item_status(self, row: int, status: str, output_path: str = ""):
         """Called by main_window._on_item_status_changed with (item_id, status)."""
+        row = self._item_row_by_id.get(row, row)
         label_map = {
             "GENERATING":  "⏳ Đang tạo",
             "DOWNLOADING": "⬇ Tải về",
@@ -734,6 +854,8 @@ class YouTubePromptPage(QWidget):
         self._lbl_ref_count.setText("0 ảnh ref bổ sung")
         self._btn_extract_style.setEnabled(False)
         self.copy_btn.setEnabled(False)
+        self._btn_copy_json.setEnabled(False)
+        self._btn_load_more.setEnabled(False)
         self.cancel_btn.setEnabled(False)
         self.start_btn.setEnabled(True)
         self._btn_start_header.setEnabled(True)
@@ -743,11 +865,14 @@ class YouTubePromptPage(QWidget):
         self._task_total = 0
         self._task_done = 0
         self._task_errors = 0
+        self.task_id = None
+        self._item_row_by_id = {}
 
     def on_item_error(self, item_id: int, error: str):
         """Called per-item error; tracks count and marks row red."""
         self._task_errors = getattr(self, "_task_errors", 0) + 1
-        self._set_row_status(item_id, "❌ Lỗi", self._STATUS_COLORS.get("ERROR"))
+        row = self._item_row_by_id.get(item_id, item_id)
+        self._set_row_status(row, f"❌ {error[:80]}", self._STATUS_COLORS.get("ERROR"))
 
     def on_task_finished(self, *args):
         self.start_btn.setEnabled(True)
